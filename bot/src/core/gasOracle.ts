@@ -60,6 +60,9 @@ const COINGECKO_URL =
 
 const FALLBACK_ETH_USD = 2000;   // last-resort constant, always logged loudly
 
+/** PERF: precomputed 10^8 — the canonical Chainlink feed decimal base. */
+const POW10_8 = 10n ** 8n;
+
 // ------------------------------------------------------------------ oracle
 export class GasOracle {
   private cache: GasFees | null = null;
@@ -68,16 +71,28 @@ export class GasOracle {
   // ---- P0-3 price state -----------------------------------------------------
   private priceCache: PriceCache | null = null;
   private inflightPrice: Promise<number> | null = null;   // dedupe concurrent fetches
+  /** PERF: memoized feed decimals — immutable on-chain value, fetch at most once per feed. */
+  private readonly feedDecimals = new Map<string, number>();
+  /** PERF: reused scratch buffer for fee-history medians (blockCount ≤ 5 + slack). */
+  private readonly rewardBuf: bigint[] = new Array(8).fill(0n);
+  /** PERF: cached config singleton (frozen object — safe to hold across reloads of *values*). */
+  private readonly cfg = getConfig();
+  /** PERF: cap constants computed ONCE — no BigInt() conversion per fees() call. */
+  private readonly capTipWei: bigint;
+  private readonly capMaxWei: bigint;
 
   constructor(
     private rpc: RpcManager,
-    private caps: { priorityCapGwei: number; maxFeeGwei: number },
-  ) {}
+    caps: { priorityCapGwei: number; maxFeeGwei: number },
+  ) {
+    this.capTipWei = BigInt(Math.round(caps.priorityCapGwei)) * GWEI;
+    this.capMaxWei = BigInt(Math.round(caps.maxFeeGwei)) * GWEI;
+  }
 
   // ------------------------------------------------------------- ETH/USD
   /** Fresh cached price, or refresh through the tier ladder. Never throws. */
   async getEthUsdPrice(): Promise<number> {
-    const ttl = getConfig().gasOracleCacheTtlMs;
+    const ttl = this.cfg.gasOracleCacheTtlMs;         // PERF: cached config ref, no singleton lookup
     const now = Date.now();
     if (this.priceCache && now - this.priceCache.timestamp < ttl) {
       return this.priceCache.price;
@@ -109,16 +124,31 @@ export class GasOracle {
 
     // ---- Tier 2: Chainlink on-chain feed ------------------------------------
     try {
-      const chainId = getConfig().chainId;
-      const feed = CHAINLINK_FEEDS.get(chainId);
+      const feed = CHAINLINK_FEEDS.get(this.cfg.chainId);
       if (feed) {
-        const [round, decimals] = await Promise.all([
-          this.rpc.client.readContract({ address: feed, abi: CHAINLINK_AGG_ABI, functionName: 'latestRoundData' }),
-          this.rpc.client.readContract({ address: feed, abi: CHAINLINK_AGG_ABI, functionName: 'decimals' }),
-        ]);
-        const answer = round[1];                       // int256
-        const dec = Number(decimals);
-        const price = Number(answer) / 10 ** dec;      // e.g. 8-dec 3.2e10 → 3200
+        // PERF: decimals() is immutable — memoize it so a feed costs at most
+        // ONE extra RPC in its entire process lifetime. The first refresh reads
+        // both values concurrently; every later refresh skips decimals() entirely.
+        let dec = this.feedDecimals.get(feed);
+        let answer: bigint;
+        if (dec === undefined) {
+          const [round0, d] = await Promise.all([
+            this.rpc.client.readContract({ address: feed, abi: CHAINLINK_AGG_ABI, functionName: 'latestRoundData' }),
+            this.rpc.client.readContract({ address: feed, abi: CHAINLINK_AGG_ABI, functionName: 'decimals' }),
+          ]);
+          dec = Number(d);
+          this.feedDecimals.set(feed, dec);
+          answer = round0[1];                    // int256
+        } else {
+          const round = await this.rpc.client.readContract({
+            address: feed, abi: CHAINLINK_AGG_ABI, functionName: 'latestRoundData',
+          });
+          answer = round[1];
+        }
+        // Exact BigInt scaling (no float division): 8-dec fast path uses the
+        // precomputed constant; exotic feeds fall back to one-time exponentiation.
+        const scaled = dec === 8 ? answer / POW10_8 : answer / 10n ** BigInt(dec);
+        const price = Number(scaled);            // e.g. 8-dec 3.2e10 → 3200
         if (Number.isFinite(price) && price > 0 && price < 1_000_000) {
           return this.setPrice(price, 'chainlink');
         }
@@ -171,21 +201,35 @@ export class GasOracle {
       const base = block.baseFeePerGas ?? 30n * GWEI;
 
       // Median of the 50th-percentile rewards across the window.
-      const rewards: bigint[] = (hist.reward ?? [])
-        .map((r: bigint[]) => r[1] ?? 1n)
-        .sort((a: bigint, b: bigint) => (a < b ? -1 : a > b ? 1 : 0));
-      const tipRaw = rewards.length ? rewards[rewards.length >> 1] : GWEI;
+      // PERF: allocation-free selection — collect into a REUSED fixed-size
+      // array (no .map() intermediate) and pick the median via in-place
+      // insertion sort on the prefix (≤5 elements, zero allocations).
+      const rw = this.rewardBuf;
+      let n = 0;
+      if (hist.reward) {
+        for (const r of hist.reward) {
+          if (n < rw.length) rw[n++] = r?.[1] ?? 1n;
+        }
+      }
+      let tipRaw = GWEI;
+      if (n > 0) {
+        // In-place insertion sort of rw[0..n) — tiny n, bigint-safe comparator.
+        for (let i = 1; i < n; i++) {
+          const v = rw[i];
+          let j = i - 1;
+          while (j >= 0 && rw[j] > v) { rw[j + 1] = rw[j]; j--; }
+          rw[j + 1] = v;
+        }
+        tipRaw = rw[n >> 1];
+      }
 
       // Project next base fee: EIP-1559 bounds change to ±12.5% per block.
       // Assume worst-case expansion (+12%) so our ceiling survives congestion.
       const projected = base + (base / 100n) * 12n;
 
-      const capTip = BigInt(Math.round(this.caps.priorityCapGwei)) * GWEI;
-      const capMax = BigInt(Math.round(this.caps.maxFeeGwei)) * GWEI;
-
-      const tip = tipRaw < capTip ? tipRaw : capTip;
-      let maxFee = projected * 2n + tip;
-      if (maxFee > capMax) {
+      const tip = tipRaw < this.capTipWei ? tipRaw : this.capTipWei;
+      const maxFee = projected * 2n + tip;
+      if (maxFee > this.capMaxWei) {
         // Ceiling would be violated → signal "skip" rather than overpay.
         this.cache = null;
         return null;

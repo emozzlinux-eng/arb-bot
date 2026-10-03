@@ -9,6 +9,10 @@
  * Memory notes:
  *  - One viem `createClient` per endpoint, built once at boot (3 clients max).
  *  - Latency history is a fixed Float64 ring buffer (64 samples ≈ 512 B/RPC).
+ *  - PERF: the ring's p95() sorts IN PLACE inside a scratch Float64Array that
+ *    is allocated ONCE per ring — no per-call array + closure allocations.
+ *  - PERF: pingAll() is re-entrancy guarded and its interval callback is
+ *    error-contained so one rejected health check can never kill monitoring.
  */
 import { createPublicClient, http, webSocket, type PublicClient } from 'viem';
 import type { RpcInfo } from './types.js';
@@ -17,14 +21,16 @@ const SAMPLES = 64;
 
 class LatencyRing {
   private buf = new Float64Array(SAMPLES);
+  private scratch = new Float64Array(SAMPLES);   // reused sort buffer — zero churn
   private i = 0;
   private n = 0;
   push(ms: number) { this.buf[this.i] = ms; this.i = (this.i + 1) % SAMPLES; if (this.n < SAMPLES) this.n++; }
   p95(): number {
     if (!this.n) return Infinity;
-    const arr = Array.prototype.slice.call(this.buf.subarray(0, this.n)) as number[];
-    arr.sort((a, b) => a - b);
-    return arr[Math.min(arr.length - 1, Math.floor(arr.length * 0.95))];
+    const s = this.scratch.subarray(0, this.n);
+    s.set(this.buf.subarray(0, this.n));         // copy into pre-allocated buffer
+    s.sort();                                    // TypedArray sort = numeric by default, no comparator alloc
+    return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))];
   }
 }
 
@@ -72,8 +78,10 @@ export class RpcManager {
   }
 
   start(intervalMs = 10_000): void {
-    this.pingAll();                                   // fire immediately…
-    this.timer = setInterval(() => this.pingAll(), intervalMs); // …then periodically
+    void this.pingAll();                                  // fire immediately…
+    // PERF/robustness: skip-if-busy (overlapping pings would skew EWMA) and
+    // swallow sync throws so a transient failure never kills the interval.
+    this.timer = setInterval(() => { void this.pingAll().catch(() => {}); }, intervalMs);
     this.timer.unref?.();                             // never block process exit
   }
 
@@ -120,11 +128,22 @@ export class RpcManager {
   }
 
   // ---------------------------------------------------------------- internals
+  private pinging = false;                        // skip-if-busy guard
+
   private async pingAll(): Promise<void> {
-    // Sequential-ish but non-blocking: Promise.all over ≤3 tiny JSON-RPC calls
-    // is fine even on dual-core; each is network-bound, not CPU-bound.
-    await Promise.all(this.clients.map((c, i) => this.pingOne(i, c)));
-    this.electBest();
+    if (this.pinging) return;                     // overlapping ticks would double RPC load
+    this.pinging = true;
+    try {
+      // Non-blocking: ≤3 tiny JSON-RPC calls in flight at once is fine even on
+      // dual-core; each is network-bound, not CPU-bound. The indexed loop
+      // avoids allocating an intermediate promise array via .map().
+      const pings = new Array<Promise<void>>(this.clients.length);
+      for (let i = 0; i < this.clients.length; i++) pings[i] = this.pingOne(i, this.clients[i]);
+      await Promise.all(pings);
+      this.electBest();
+    } finally {
+      this.pinging = false;
+    }
   }
 
   private async pingOne(i: number, c: PublicClient): Promise<void> {

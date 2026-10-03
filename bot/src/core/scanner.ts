@@ -22,6 +22,8 @@
  *    unbounded array — that would spike both heap and libuv threadpool.
  *  - Results are pushed into a pre-allocated ring of PairQuote objects that we
  *    MUTATE IN PLACE (same object identity forever) → near-zero GC pressure.
+ *  - PERF: LIVE quotes use ONE multicall for both pool slot0() reads instead
+ *    of two sequential round-trips — halves RPC latency per scan pass.
  */
 import { createPublicClient, http, type Chain, type PublicClient } from 'viem';
 import { mainnet, base, baseSepolia, polygon, polygonAmoy, arbitrum, optimism } from 'viem/chains';
@@ -117,15 +119,24 @@ export function getPublicClient(): PublicClient {
 export function getVerifiedChainId(): number { return verifiedChainId; }
 
 // ------------------------------------------------------------------ scanner
+type Slot0Result = readonly [bigint, number, number, number, boolean, boolean];
+
 export class Scanner {
   private quotes: Map<string, PairQuote>;   // reused objects, mutated in place
   private timer: NodeJS.Timeout | null = null;
   private scanning = false;
   private blockSeen = 0;
+  /** PERF: cached config + derived hot-path values — no getConfig()/toLowerCase per scan. */
+  private readonly cfg = getConfig();
+  private readonly poolALower = this.cfg.poolA.toLowerCase();
+  private readonly poolBLower = this.cfg.poolB.toLowerCase();
+  /** PERF: stable job-key array + reusable results buffer (no per-scan allocation). */
+  private readonly jobKeys: string[];
+  private readonly results: (PairQuote | null)[];
   onLog?: (msg: string) => void;
 
   constructor(private rpc: RpcManager, private gas: GasOracle) {
-    const cfg = getConfig();
+    const cfg = this.cfg;
     // P0-1: pools come from .env now — no POOL_REGISTRY constant anywhere.
     if (cfg.mode === 'live' && (!cfg.poolA || !cfg.poolB)) {
       console.error('[scanner] FATAL: POOL_A/POOL_B missing in .env (LIVE mode)');
@@ -139,6 +150,8 @@ export class Scanner {
         priceA: 0n, priceB: 0n, spreadBps: 0, blockNumber: 0, ts: 0,
       });
     }
+    this.jobKeys = [...this.quotes.keys()];
+    this.results = new Array(this.jobKeys.length).fill(null);
   }
 
   /** Skip-if-busy wrapper: overlapping scans would double RPC load on the MBA. */
@@ -153,7 +166,7 @@ export class Scanner {
   }
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = null; }
 
-  latestQuotes(): PairQuote[] { return [...this.quotes.values()]; }
+  latestQuotes(): IterableIterator<PairQuote> { return this.quotes.values(); }
 
   /** Single pass over all pairs with a bounded concurrency window. */
   async scanOnce(): Promise<ArbOpportunity[]> {
@@ -161,24 +174,30 @@ export class Scanner {
     this.scanning = true;
     try {
       const out: ArbOpportunity[] = [];
-      const jobs = [...this.quotes.keys()];
-      const results: (PairQuote | null)[] = new Array(jobs.length).fill(null);
+      const jobs = this.jobKeys;
+      const results = this.results;
+      results.fill(null);                       // reuse buffer — zero per-scan allocation
 
       // Semaphore-style window: exactly N promises alive at any moment.
       let cursor = 0;
-      const workers = Array.from({ length: Math.min(getConfig().maxConcurrentScans, jobs.length) }, async () => {
+      const worker = async (): Promise<void> => {
         while (cursor < jobs.length) {
           const idx = cursor++;
           try { results[idx] = await this.quoteFor(jobs[idx]); }
           catch (e) { this.onLog?.(`[scan] ${jobs[idx]}: ${(e as Error).message.slice(0, 60)}`); }
         }
-      });
+      };
+      const nWorkers = Math.min(this.cfg.maxConcurrentScans, jobs.length);
+      const workers = new Array<Promise<void>>(nWorkers);
+      for (let i = 0; i < nWorkers; i++) workers[i] = worker();
       await Promise.all(workers);
 
       const fees = await this.gas.fees(this.blockSeen || 1);
-      for (const q of results) {
+      const fallbackGasUsd = fees?.estimatedUsd ?? 0.5;
+      for (let i = 0; i < results.length; i++) {
+        const q = results[i];
         if (!q) continue;
-        const opp = this.toOpportunity(q, fees?.estimatedUsd ?? 0.5);
+        const opp = this.toOpportunity(q, fallbackGasUsd);
         if (opp) out.push(opp);
       }
       out.sort((a, b) => b.expectedProfitUsd - a.expectedProfitUsd); // best first, tiny array
@@ -190,7 +209,7 @@ export class Scanner {
 
   // ------------------------------------------------------------------ per-pair
   private async quoteFor(pair: string): Promise<PairQuote | null> {
-    const cfg = getConfig();
+    const cfg = this.cfg;
     const q = this.quotes.get(pair)!;           // existing object — mutate in place
     if (cfg.mode === 'demo') {
       const t = Date.now();
@@ -205,13 +224,32 @@ export class Scanner {
     }
 
     // LIVE: single configured route (POOL_A cheap leg, POOL_B expensive leg).
-    const pa = await this.getPoolQuote(cfg.poolA as `0x${string}`);
-    const pb = await this.getPoolQuote(cfg.poolB as `0x${string}`);
+    // PERF: BOTH slot0() reads go out as ONE JSON-RPC multicall batch —
+    // one round-trip instead of two sequential ones (halves per-pass latency).
+    const paAddr = cfg.poolA as `0x${string}`;
+    const pbAddr = cfg.poolB as `0x${string}`;
+    let pa: bigint | null;
+    let pb: bigint | null;
+    try {
+      const batched = await this.rpc.client.multicall({
+        allowFailure: true,
+        contracts: [
+          { address: paAddr, abi: SLOT0_ABI, functionName: 'slot0' },
+          { address: pbAddr, abi: SLOT0_ABI, functionName: 'slot0' },
+        ],
+      });
+      const [ra, rb] = batched;
+      pa = ra.status === 'success' ? this.priceFromSqrt((ra.result as Slot0Result)[0], 18, 18) : null;
+      pb = rb.status === 'success' ? this.priceFromSqrt((rb.result as Slot0Result)[0], 18, 18) : null;
+    } catch (e) {
+      this.onLog?.(`[scan] ${pair} multicall failed: ${(e as Error).message.slice(0, 60)}`);
+      return null;
+    }
     if (pa === null || pb === null) return null;
 
     q.priceA = pa; q.priceB = pb;
     q.spreadBps = pa > 0n ? Number(((pb - pa) * 10_000n) / pa) / 10_000 : 0; // signed bps
-    q.poolA = cfg.poolA; q.poolB = cfg.poolB;
+    q.poolA = paAddr; q.poolB = pbAddr;
     q.blockNumber = ++this.blockSeen; q.ts = Date.now();
     return q;
   }
@@ -219,11 +257,11 @@ export class Scanner {
   /**
    * P0-1 allow-list guard: only the two pools from .env may ever be quoted.
    * A malformed/spread quote can never drag us onto a rogue pool.
+   * PERF: compares against PRE-LOWERED constants captured at construction.
    */
   private poolAllowed(pool: `0x${string}`): boolean {
-    const cfg = getConfig();
-    const ok = pool.toLowerCase() === cfg.poolA.toLowerCase() ||
-               pool.toLowerCase() === cfg.poolB.toLowerCase();
+    const lower = pool.toLowerCase();
+    const ok = lower === this.poolALower || lower === this.poolBLower;
     if (!ok) this.onLog?.(`[scan] REJECTED non-configured pool ${pool.slice(0, 10)}…`);
     return ok;
   }
@@ -245,20 +283,28 @@ export class Scanner {
   /**
    * price(token1 per token0) = sqrtP^2 / 2^192, rescaled by 10^(d0-d1) and
    * pushed to an 1e18 fixed point for cross-pool comparison.
+   * PERF: the two powers of ten are module constants — no BigInt exponentiation
+   * on the hot path (this runs twice per pair per scan).
    */
-  private priceFromSqrt(sqrtX96: bigint, decOut: number, decIn: number): bigint {
+  private static readonly P18_IN = 10n ** 36n;    // 10^(18+decIn), decIn fixed at 18
+  private static readonly P_OUT = 10n ** 18n;     // 10^decOut, decOut fixed at 18
+
+  private priceFromSqrt(sqrtX96: bigint, _decOut: number, _decIn: number): bigint {
     const sq = sqrtX96 * sqrtX96;                       // x192 fixed point
-    const scaled = (sq * 10n ** BigInt(18 + decIn)) >> 192n;
-    return scaled / 10n ** BigInt(decOut);
+    const scaled = (sq * Scanner.P18_IN) >> 192n;
+    return scaled / Scanner.P_OUT;
   }
 
   // ------------------------------------------------------------- economics
+  /** PERF: premium as a precomputed float constant — no Number() conversion per call. */
+  private static readonly PREMIUM_FRAC = Number(AAVE_PREMIUM_BPS) / 10_000;
+
   private toOpportunity(q: PairQuote, gasUsd: number): ArbOpportunity | null {
-    const cfg = getConfig();
+    const cfg = this.cfg;
     if (Math.abs(q.spreadBps) < 10) return null;              // floor: sub-10bps never clears costs
     const borrowedUsd = Math.min(cfg.maxLoanUsd, 25_000);      // conservative depth cap
     const grossUsd = (borrowedUsd * Math.abs(q.spreadBps)) / 10_000;
-    const premiumUsd = (borrowedUsd * Number(AAVE_PREMIUM_BPS)) / 10_000;
+    const premiumUsd = borrowedUsd * Scanner.PREMIUM_FRAC;
     const net = grossUsd - premiumUsd - gasUsd;
     if (net < cfg.minProfitUsd) return null;                  // strict minProfit gate OFF-chain too
     return {
