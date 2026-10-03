@@ -1,0 +1,32 @@
+{
+  "name": "flash-loan-arb",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aave V3 flash-loan arbitrage bot \u2014 optimized for 2017 MacBook Air (i5/8GB)",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && cd ../contracts && forge build --sizes 2>/dev/null || true",
+    "demo": "NODE_OPTIONS=\"--max-old-space-size=384\" node dist/index.js --mode demo",
+    "live": "NODE_OPTIONS=\"--max-old-space-size=384\" node dist/index.js --mode live",
+    "start": "pm2 start ecosystem.config.cjs",
+    "stop": "pm2 delete flash-loan-arb",
+    "logs": "pm2 logs flash-loan-arb --lines 50",
+    "deploy": "cd ../contracts && forge script script/Deploy.s.sol:DeployScript --rpc-url $RPC_PRIMARY --broadcast -vvv",
+    "test:sol": "cd ../contracts && forge test -vvv",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "viem": "^2.21.0",
+    "blessed": "^0.1.81",
+    "grammy": "^1.21.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.14.0",
+    "@types/blessed": "^0.1.25"
+  }
+}
