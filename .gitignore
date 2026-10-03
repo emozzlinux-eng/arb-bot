@@ -1,6 +1,2 @@
-# Dependencies
-node_modules/
-
-# Build artifacts (Foundry)
-out/
-cache/
+# TypeScript build info
+*.tsbuildinfo
